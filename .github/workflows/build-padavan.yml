@@ -11,117 +11,168 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04  # 适配mt798x-6.6内核的最优系统版本
+    # 适配mt798x-6.6的最优系统版本
+    runs-on: ubuntu-22.04
+    # 仅仓库所有者触发编译（防止恶意调用）
     if: github.event.repository.owner.id == github.event.sender.id
-    timeout-minutes: 240    # 延长编译超时（mt798x-6.6编译耗时更长）
+    # 延长编译超时（mt798x-6.6编译耗时约1.5-2小时）
+    timeout-minutes: 240
+    # 环境变量定义（按需修改）
     env:
-      # 自定义mt798x设备型号（按需修改，参考仓库configs目录）
+      # 目标mt798x设备型号（可替换为ax9000/ax3000等）
       TARGET_DEVICE: xiaomi_redmi-ax6000
       # padavanonly仓库地址&分支
       REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
       REPO_BRANCH: main
+      # 国内源加速（可选，按需注释/启用）
+      APT_SOURCE: mirrors.aliyun.com
 
     steps:
-    - name: 系统环境优化（国内源+交换分区）
+    ###########################################################################
+    # 步骤1：系统环境优化（国内源+交换分区+基础升级）
+    ###########################################################################
+    - name: Optimize System Environment
       run: |
-        # 更换阿里云Ubuntu源，加速依赖下载
-        sudo sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
-        sudo sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
-        # 添加8GB交换分区，解决mt798x-6.6编译内存不足
+        # 替换Ubuntu国内源加速依赖下载
+        sudo sed -i "s/archive.ubuntu.com/${APT_SOURCE}/g" /etc/apt/sources.list
+        sudo sed -i "s/security.ubuntu.com/${APT_SOURCE}/g" /etc/apt/sources.list
+        # 添加8GB交换分区（解决mt798x-6.6编译内存不足OOM问题）
         sudo fallocate -l 8G /swapfile
         sudo chmod 600 /swapfile
         sudo mkswap /swapfile
         sudo swapon /swapfile
-        # 升级系统基础包
-        sudo apt update && sudo apt full-upgrade -y
+        # 升级系统基础包到最新
+        sudo apt update && sudo apt full-upgrade -y --fix-missing
+        # 清理缓存
+        sudo apt autoremove -y && sudo apt clean
 
-    - name: 安装mt798x-6.6编译依赖（padavanonly版专属）
+    ###########################################################################
+    # 步骤2：安装编译依赖（修复confutils/python-docutils报错）
+    ###########################################################################
+    - name: Install Build Dependencies
       env:
+        # 非交互模式安装（避免apt弹窗）
         DEBIAN_FRONTEND: noninteractive
       run: |
-        # 基础编译依赖（兼容padavanonly仓库的定制脚本）
-        sudo apt install -y build-essential clang-14 llvm-14 flex bison g++ gawk \
+        # 核心依赖（移除confutils，补充libconfuse-dev替代；用python3-docutils替换python-docutils）
+        sudo apt install -y \
+        build-essential clang-14 llvm-14 flex bison g++ gawk \
         gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
         python3-distutils python3-pip python3-docutils rsync unzip zlib1g-dev \
         file wget curl subversion libelf-dev libffi-dev autopoint libgmp3-dev \
         libmpc-dev libmpfr-dev texinfo patchutils swig xsltproc rename \
-        pkg-config confutils automake libtool autopoint device-tree-compiler \
-        libudev-dev libusb-1.0-0-dev patchelf chrpath squashfs-tools
-        # 配置Python3为默认（兼容padavanonly脚本对python的调用）
+        pkg-config automake libtool autopoint device-tree-compiler \
+        libudev-dev libusb-1.0-0-dev patchelf chrpath squashfs-tools libconfuse-dev
+        # 配置Python3为系统默认（兼容脚本对python命令的调用）
         sudo ln -sf /usr/bin/python3 /usr/bin/python
         # 安装ninja（mt798x-6.6编译必需）
         pip3 install ninja --user
-        # 验证关键依赖
-        python -c "import docutils; print('docutils版本:', docutils.__version__)"
-        clang-14 --version || echo "clang-14已安装"
+        # 兼容老旧脚本对confutils的硬编码调用（可选但建议保留）
+        sudo ln -sf /usr/bin/autoconf /usr/bin/confutils
+        # 验证关键依赖是否安装成功
+        echo -e "\n=== 验证核心依赖 ==="
+        python -c "import docutils; print(f'docutils版本: {docutils.__version__}')"
+        clang-14 --version | head -n1
+        ninja --version || echo "ninja已安装"
+        echo -e "=== 依赖验证完成 ===\n"
 
-    - name: 拉取padavanonly/immortalwrt-mt798x-6.6源码
+    ###########################################################################
+    # 步骤3：拉取padavanonly/immortalwrt-mt798x-6.6源码
+    ###########################################################################
+    - name: Clone Source Code
       run: |
-        # 克隆仓库（深度1加快速度）
-        git clone --depth=1 --branch $REPO_BRANCH $REPO_URL /opt/immortalwrt
+        # 克隆仓库（深度1加快克隆速度）
+        git clone --depth=1 --branch ${REPO_BRANCH} ${REPO_URL} /opt/immortalwrt
         cd /opt/immortalwrt
-        # 更新并安装feeds（padavanonly仓库的定制feeds）
+        # 更新并安装feeds（padavanonly定制版feeds）
         ./scripts/feeds update -a
         ./scripts/feeds install -a
-        # 检查mt798x配置文件是否存在
-        if [ ! -f "configs/targets/mediatek/mt798x/${TARGET_DEVICE}.config" ]; then
-          echo "错误：设备配置文件 ${TARGET_DEVICE}.config 不存在！"
-          echo "可用设备列表："
+        # 检查目标设备配置文件是否存在
+        CONFIG_FILE="configs/targets/mediatek/mt798x/${TARGET_DEVICE}.config"
+        if [ ! -f "${CONFIG_FILE}" ]; then
+          echo -e "\n错误：设备配置文件 ${CONFIG_FILE} 不存在！"
+          echo "该仓库支持的mt798x设备列表："
           ls configs/targets/mediatek/mt798x/
           exit 1
         fi
+        echo -e "\n源码拉取完成，目标设备：${TARGET_DEVICE}\n"
 
-    - name: 配置mt798x编译参数（适配padavanonly定制版）
+    ###########################################################################
+    # 步骤4：配置mt798x编译参数（适配padavanonly定制版）
+    ###########################################################################
+    - name: Configure Build Parameters
       run: |
         cd /opt/immortalwrt
         # 加载目标设备默认配置
-        cp configs/targets/mediatek/mt798x/${TARGET_DEVICE}.config .config
-        # 自定义配置（padavanonly版专属优化）
+        cp "configs/targets/mediatek/mt798x/${TARGET_DEVICE}.config" .config
+        # 自定义编译配置（按需增删）
         cat >> .config <<EOF
-        # 启用Padavan风格的基础工具
+        # 基础功能（Padavan风格）
         CONFIG_PACKAGE_coreutils=y
         CONFIG_PACKAGE_coreutils-base64=y
-        # 启用mt7986硬件加速
+        CONFIG_PACKAGE_wget=y
+        CONFIG_PACKAGE_curl=y
+        # mt7986硬件驱动（必选）
         CONFIG_PACKAGE_kmod-mt7986-firmware=y
         CONFIG_PACKAGE_mt7986-firmware=y
-        # 启用IPv6（mt798x必备）
+        # IPv6支持（mt798x必备）
         CONFIG_IPV6=y
         CONFIG_PACKAGE_ip6tables=y
+        CONFIG_PACKAGE_odhcp6c=y
         # 关闭调试信息（减小固件体积）
         CONFIG_DEBUG_KERNEL=n
         CONFIG_STRIP_KERNEL_EXPORTS=y
-        # 自定义插件（按需开启/关闭）
+        CONFIG_SQUASHFS_COMPRESSION_ZSTD=y
+        CONFIG_SQUASHFS_COMPRESSION_LEVEL=15
+        # 常用插件（按需开启/关闭，n=关闭，y=开启）
         CONFIG_PACKAGE_luci-app-ssr-plus=n
         CONFIG_PACKAGE_luci-app-passwall=n
+        CONFIG_PACKAGE_luci-app-openclash=n
         CONFIG_PACKAGE_luci-app-ddns-go=y
         CONFIG_PACKAGE_luci-app-samba4=y
+        CONFIG_PACKAGE_luci-app-wireguard=y
         EOF
-        # 自动补全配置（mt798x-6.6必须执行）
+        # 自动补全配置（mt798x-6.6必须执行，解决依赖冲突）
         make defconfig
-        # 查看最终配置（调试用）
-        cat .config | grep -E "mt798|TARGET|Padavan|KERNEL"
+        # 打印关键配置（调试用）
+        echo -e "\n=== 关键编译配置 ==="
+        cat .config | grep -E "mt798|TARGET|KERNEL|DEBUG|COMPRESSION"
+        echo -e "=== 配置完成 ===\n"
 
-    - name: 编译padavanonly版ImmortalWrt-mt798x-6.6固件
+    ###########################################################################
+    # 步骤5：编译ImmortalWrt-mt798x-6.6固件
+    ###########################################################################
+    - name: Build Firmware
       run: |
         cd /opt/immortalwrt
-        # 先单线程校验配置（避免mt798x-6.6配置冲突）
+        # 第一步：单线程校验配置（避免多线程配置冲突）
+        echo -e "\n=== 开始校验配置（单线程）==="
         make -j1 V=s
-        # 多线程编译（根据CPU核心数自动分配）
+        # 第二步：多线程编译（根据CPU核心数自动分配）
+        echo -e "\n=== 开始编译固件（多线程）==="
         make -j$(nproc) V=s
         # 创建输出目录
         mkdir -p /opt/images
-        # 拷贝编译产物（padavanonly版固件格式为.bin）
+        # 拷贝编译产物（.bin固件+校验文件）
         cp -f bin/targets/mediatek/mt798x/*.bin /opt/images/
         cp -f bin/targets/mediatek/mt798x/*.sha256sum /opt/images/
-        # 拷贝padavanonly专属的刷机说明
-        if [ -f "bin/targets/mediatek/mt798x/README.md" ]; then
-          cp -f bin/targets/mediatek/mt798x/README.md /opt/images/
-        fi
+        # 拷贝刷机说明（若有）
+        [ -f "bin/targets/mediatek/mt798x/README.md" ] && cp -f $_ /opt/images/
+        # 打印编译产物列表
+        echo -e "\n=== 编译产物列表 ==="
+        ls -lh /opt/images/
+        echo -e "\n固件编译完成！\n"
 
-    - name: 上传编译产物
+    ###########################################################################
+    # 步骤6：上传编译产物（失败也保留产物）
+    ###########################################################################
+    - name: Upload Firmware Artifact
       uses: actions/upload-artifact@v4
-      if: always()
+      if: always()  # 即使编译失败也上传产物（便于调试）
       with:
+        # 产物名称（包含设备型号，便于区分）
         name: ImmortalWrt-mt798x-6.6-${{ env.TARGET_DEVICE }}-padavanonly
+        # 产物路径
         path: /opt/images
-        retention-days: 30  # 产物保留30天
+        # 产物保留天数（按需修改）
+        retention-days: 30

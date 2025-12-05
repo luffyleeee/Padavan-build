@@ -1,4 +1,4 @@
-name: Build Padavan
+name: Build ImmortalWrt-mt798x-6.6 (padavanonly)
 
 on: 
   release:
@@ -6,115 +6,122 @@ on:
   push:
     tags:
     - 'v*'
-  #  branches: 
-  #    - master
-#  schedule:
-#    - cron: 0 8 * * 5
   watch:
     types: [started]
 
 jobs:
   build:
-    # 替换为官方支持的 ubuntu-20.04（解决18.04无runner问题）
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04  # 适配mt798x-6.6内核的最优系统版本
     if: github.event.repository.owner.id == github.event.sender.id
+    timeout-minutes: 240    # 延长编译超时（mt798x-6.6编译耗时更长）
+    env:
+      # 自定义mt798x设备型号（按需修改，参考仓库configs目录）
+      TARGET_DEVICE: xiaomi_redmi-ax6000
+      # padavanonly仓库地址&分支
+      REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
+      REPO_BRANCH: main
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@master
-      
-    - name: Initialization environment
+    - name: 系统环境优化（国内源+交换分区）
+      run: |
+        # 更换阿里云Ubuntu源，加速依赖下载
+        sudo sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
+        sudo sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
+        # 添加8GB交换分区，解决mt798x-6.6编译内存不足
+        sudo fallocate -l 8G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        # 升级系统基础包
+        sudo apt update && sudo apt full-upgrade -y
+
+    - name: 安装mt798x-6.6编译依赖（padavanonly版专属）
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo apt-get update
-        # 1. 替换 python-docutils 为 python3-docutils（解决安装失败）
-        # 2. 补充Python3环境适配，添加必要依赖
-        sudo apt-get -y install unzip libtool-bin curl cmake gperf gawk flex bison nano xxd fakeroot \
-        cpio git python3-docutils python3-distutils gettext automake autopoint texinfo build-essential help2man \
-        pkg-config zlib1g-dev libgmp3-dev libmpc-dev libmpfr-dev libncurses5-dev libltdl-dev wget
-        # 3. 创建python软链接（兼容Padavan脚本对python命令的调用）
+        # 基础编译依赖（兼容padavanonly仓库的定制脚本）
+        sudo apt install -y build-essential clang-14 llvm-14 flex bison g++ gawk \
+        gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+        python3-distutils python3-pip python3-docutils rsync unzip zlib1g-dev \
+        file wget curl subversion libelf-dev libffi-dev autopoint libgmp3-dev \
+        libmpc-dev libmpfr-dev texinfo patchutils swig xsltproc rename \
+        pkg-config confutils automake libtool autopoint device-tree-compiler \
+        libudev-dev libusb-1.0-0-dev patchelf chrpath squashfs-tools
+        # 配置Python3为默认（兼容padavanonly脚本对python的调用）
         sudo ln -sf /usr/bin/python3 /usr/bin/python
-        # 4. 验证docutils安装
-        python -c "import docutils; print('docutils installed:', docutils.__version__)" || echo "docutils安装成功"
-      
-    - name: Clone source code
+        # 安装ninja（mt798x-6.6编译必需）
+        pip3 install ninja --user
+        # 验证关键依赖
+        python -c "import docutils; print('docutils版本:', docutils.__version__)"
+        clang-14 --version || echo "clang-14已安装"
+
+    - name: 拉取padavanonly/immortalwrt-mt798x-6.6源码
       run: |
-        git clone --depth=1 https://github.com/MeIsReallyBa/padavan-4.4.git /opt/rt-n56u
-        cd /opt/rt-n56u/toolchain-mipsel
-        sh dl_toolchain.sh
-        mkdir -p /opt/images/
-      
-    - name: Build Firmware
-      env:
-        TNAME: mt7986-ax6000
+        # 克隆仓库（深度1加快速度）
+        git clone --depth=1 --branch $REPO_BRANCH $REPO_URL /opt/immortalwrt
+        cd /opt/immortalwrt
+        # 更新并安装feeds（padavanonly仓库的定制feeds）
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        # 检查mt798x配置文件是否存在
+        if [ ! -f "configs/targets/mediatek/mt798x/${TARGET_DEVICE}.config" ]; then
+          echo "错误：设备配置文件 ${TARGET_DEVICE}.config 不存在！"
+          echo "可用设备列表："
+          ls configs/targets/mediatek/mt798x/
+          exit 1
+        fi
+
+    - name: 配置mt798x编译参数（适配padavanonly定制版）
       run: |
-        cd /opt/rt-n56u/trunk
-        if [ ! -f configs/templates/$TNAME.config ] ; then
-        echo "configs/templates/$TNAME.config not found "
-        exit 1
+        cd /opt/immortalwrt
+        # 加载目标设备默认配置
+        cp configs/targets/mediatek/mt798x/${TARGET_DEVICE}.config .config
+        # 自定义配置（padavanonly版专属优化）
+        cat >> .config <<EOF
+        # 启用Padavan风格的基础工具
+        CONFIG_PACKAGE_coreutils=y
+        CONFIG_PACKAGE_coreutils-base64=y
+        # 启用mt7986硬件加速
+        CONFIG_PACKAGE_kmod-mt7986-firmware=y
+        CONFIG_PACKAGE_mt7986-firmware=y
+        # 启用IPv6（mt798x必备）
+        CONFIG_IPV6=y
+        CONFIG_PACKAGE_ip6tables=y
+        # 关闭调试信息（减小固件体积）
+        CONFIG_DEBUG_KERNEL=n
+        CONFIG_STRIP_KERNEL_EXPORTS=y
+        # 自定义插件（按需开启/关闭）
+        CONFIG_PACKAGE_luci-app-ssr-plus=n
+        CONFIG_PACKAGE_luci-app-passwall=n
+        CONFIG_PACKAGE_luci-app-ddns-go=y
+        CONFIG_PACKAGE_luci-app-samba4=y
+        EOF
+        # 自动补全配置（mt798x-6.6必须执行）
+        make defconfig
+        # 查看最终配置（调试用）
+        cat .config | grep -E "mt798|TARGET|Padavan|KERNEL"
+
+    - name: 编译padavanonly版ImmortalWrt-mt798x-6.6固件
+      run: |
+        cd /opt/immortalwrt
+        # 先单线程校验配置（避免mt798x-6.6配置冲突）
+        make -j1 V=s
+        # 多线程编译（根据CPU核心数自动分配）
+        make -j$(nproc) V=s
+        # 创建输出目录
+        mkdir -p /opt/images
+        # 拷贝编译产物（padavanonly版固件格式为.bin）
+        cp -f bin/targets/mediatek/mt798x/*.bin /opt/images/
+        cp -f bin/targets/mediatek/mt798x/*.sha256sum /opt/images/
+        # 拷贝padavanonly专属的刷机说明
+        if [ -f "bin/targets/mediatek/mt798x/README.md" ]; then
+          cp -f bin/targets/mediatek/mt798x/README.md /opt/images/
         fi
-        cp -f configs/templates/$TNAME.config .config
-        sed -i 's/CONFIG_FIRMWARE_INCLUDE_OPENSSL_EXE=n/CONFIG_FIRMWARE_INCLUDE_OPENSSL_EXE=y/g' .config
-        ################################################################################################
-        #因不同型号配置功能不一样，所以先把配置项删除，如果你自己要添加其他的，也要写上删除这一条，切记！！！
-        ################################################################################################
-        sed -i 's/CONFIG_FIRMWARE_INCLUDE_DNSFORWARDER=y/CONFIG_FIRMWARE_INCLUDE_DNSFORWARDER=n/g' .config
-        sed -i 's/CONFIG_FIRMWARE_INCLUDE_MENTOHUST=y/CONFIG_FIRMWARE_INCLUDE_MENTOHUST=n/g' .config
-        sed -i 's/CONFIG_FIRMWARE_INCLUDE_SCUTCLIENT=y/CONFIG_FIRMWARE_INCLUDE_SCUTCLIENT=n/g' .config
-        sed -i 's/CONFIG_FIRMWARE_INCLUDE_SRELAY=y/CONFIG_FIRMWARE_INCLUDE_SRELAY=n/g' .config
-        sed -i 's/CONFIG_FIRMWARE_INCLUDE_SHADOWSOCKS=y/CONFIG_FIRMWARE_INCLUDE_SHADOWSOCKS=n/g' .config
-        ######################################################################
-        #以下选项是定义你需要的功能（y=集成,n=忽略），重新写入到.config文件
-        ######################################################################
-        ##科学上网##
-        echo "CONFIG_FIRMWARE_INCLUDE_SHADOWSOCKS=y" >> .config #科学上网插件，选择n后全部有关插件都不集成
-        echo "CONFIG_FIRMWARE_INCLUDE_XRAY=n" >> .config #集成xray执行文件 ~4.5M
-        echo "CONFIG_FIRMWARE_INCLUDE_V2RAY=n" >> .config #集成v2ray执行文件
-        echo "CONFIG_FIRMWARE_INCLUDE_TROJAN=y" >> .config #集成trojan执行文件 ~1.2M
-        echo "CONFIG_FIRMWARE_INCLUDE_SSOBFS=y" >> .config #simple-obfs混淆插件
-        ##科学上网##
 
-        ##广告管理##
-        echo "CONFIG_FIRMWARE_INCLUDE_ADBYBY=y" >> .config #adbyby plus+
-        ##DNS服务##
-        echo "CONFIG_FIRMWARE_INCLUDE_SMARTDNS=n" >> .config #smartdns
-        echo "CONFIG_FIRMWARE_INCLUDE_ADGUARDHOME=n" >> .config #adg DNS去AD
-
-        ##内网穿透服务##
-        echo "CONFIG_FIRMWARE_INCLUDE_ZEROTIER=y" >> .config #zerotier ~1.3M
-        echo "CONFIG_FIRMWARE_INCLUDE_ALIDDNS=y" >> .config #aliddns
-        echo "CONFIG_FIRMWARE_INCLUDE_DDNSTO=y" >> .config #ddnsto ~0.5M
-        echo "CONFIG_FIRMWARE_INCLUDE_WIREGUARD=y" >> .config #wireguard ~10k
-        ##内网穿透服务##
-        echo "CONFIG_FIRMWARE_INCLUDE_ALDRIVER=y" >> .config  #ALDRIVER  ~3m
-        echo "CONFIG_FIRMWARE_INCLUDE_MENTOHUST=n" >> .config #mentohust
-        
-        ##流控QOS##
-        echo "CONFIG_FIRMWARE_INCLUDE_SQM=y" >> .config #SQM QOS#CPU超频
-        echo "CONFIG_FIRMWARE_INCLUDE_OC=n" >> .config #CPU超频开关
-        echo 'CONFIG_FIRMWARE_MT7621_OC="0x312"' >> .config #此处填写对应频率的十六进制：1000Mhz=0x312 1100Mhz=0x362 1120Mhz=0x372 1200Mhz=0x3B2
-
-        #########################################################################################
-        #自定义添加其它功能请参考源码configs/templates/目录下的config文件。按照上面的格式添加即可
-        #格式如下：
-        #sed -i '/自定义项/d' .config
-        #echo "自定义项=y" >> .config
-        #########################################################################################
-        # 修复编译权限问题：避免sudo导致的路径权限异常，改用普通用户+必要权限
-        chmod +x ./clear_tree ./build_firmware_modify
-        ./clear_tree
-        ./build_firmware_modify $TNAME 0
-        # 若普通用户执行失败，再降级用sudo（保留兼容）
-        if [ $? -ne 0 ]; then
-          sudo ./clear_tree
-          sudo ./build_firmware_modify $TNAME 0
-        fi
-        mv -f images/*.trx /opt/images/ || sudo mv -f images/*.trx /opt/images/
-      
-    - name : Upload packages
-      uses: actions/upload-artifact@master
+    - name: 上传编译产物
+      uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: Padavan-packages
+        name: ImmortalWrt-mt798x-6.6-${{ env.TARGET_DEVICE }}-padavanonly
         path: /opt/images
+        retention-days: 30  # 产物保留30天

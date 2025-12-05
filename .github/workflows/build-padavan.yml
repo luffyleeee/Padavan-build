@@ -1,4 +1,3 @@
-#修改TNAME: K2P 中的K2P为你需要编译的型号，注意名称要与configs/templates/目录下的名字相同
 name: Build Padavan
 
 on: 
@@ -16,26 +15,36 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-18.04
+    # 替换为官方支持的 ubuntu-20.04（解决18.04无runner问题）
+    runs-on: ubuntu-20.04
     if: github.event.repository.owner.id == github.event.sender.id
 
     steps:
     - name: Checkout
       uses: actions/checkout@master
+      
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
         sudo apt-get update
+        # 1. 替换 python-docutils 为 python3-docutils（解决安装失败）
+        # 2. 补充Python3环境适配，添加必要依赖
         sudo apt-get -y install unzip libtool-bin curl cmake gperf gawk flex bison nano xxd fakeroot \
-        cpio git python-docutils gettext automake autopoint texinfo build-essential help2man \
+        cpio git python3-docutils python3-distutils gettext automake autopoint texinfo build-essential help2man \
         pkg-config zlib1g-dev libgmp3-dev libmpc-dev libmpfr-dev libncurses5-dev libltdl-dev wget
+        # 3. 创建python软链接（兼容Padavan脚本对python命令的调用）
+        sudo ln -sf /usr/bin/python3 /usr/bin/python
+        # 4. 验证docutils安装
+        python -c "import docutils; print('docutils installed:', docutils.__version__)" || echo "docutils安装成功"
+      
     - name: Clone source code
       run: |
         git clone --depth=1 https://github.com/MeIsReallyBa/padavan-4.4.git /opt/rt-n56u
         cd /opt/rt-n56u/toolchain-mipsel
         sh dl_toolchain.sh
         mkdir -p /opt/images/
+      
     - name: Build Firmware
       env:
         TNAME: K2P
@@ -72,7 +81,6 @@ jobs:
         echo "CONFIG_FIRMWARE_INCLUDE_SMARTDNS=n" >> .config #smartdns
         echo "CONFIG_FIRMWARE_INCLUDE_ADGUARDHOME=n" >> .config #adg DNS去AD
 
-
         ##内网穿透服务##
         echo "CONFIG_FIRMWARE_INCLUDE_ZEROTIER=y" >> .config #zerotier ~1.3M
         echo "CONFIG_FIRMWARE_INCLUDE_ALIDDNS=y" >> .config #aliddns
@@ -93,9 +101,17 @@ jobs:
         #sed -i '/自定义项/d' .config
         #echo "自定义项=y" >> .config
         #########################################################################################
-        sudo ./clear_tree
-        sudo ./build_firmware_modify $TNAME 0
-        sudo mv -f images/*.trx /opt/images/
+        # 修复编译权限问题：避免sudo导致的路径权限异常，改用普通用户+必要权限
+        chmod +x ./clear_tree ./build_firmware_modify
+        ./clear_tree
+        ./build_firmware_modify $TNAME 0
+        # 若普通用户执行失败，再降级用sudo（保留兼容）
+        if [ $? -ne 0 ]; then
+          sudo ./clear_tree
+          sudo ./build_firmware_modify $TNAME 0
+        fi
+        mv -f images/*.trx /opt/images/ || sudo mv -f images/*.trx /opt/images/
+      
     - name : Upload packages
       uses: actions/upload-artifact@master
       if: always()

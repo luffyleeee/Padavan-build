@@ -47,7 +47,7 @@ jobs:
       
     - name: Build Firmware
       env:
-        TNAME: K2P
+        TNAME: mt7986-ax6000
       run: |
         cd /opt/rt-n56u/trunk
         if [ ! -f configs/templates/$TNAME.config ] ; then

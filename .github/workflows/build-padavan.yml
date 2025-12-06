@@ -21,7 +21,7 @@ jobs:
 
     steps:
     ###########################################################################
-    # 1. 深度清理磁盘 + 修复APT源（关键：添加universe源）
+    # 1. 深度清理磁盘 + 修复APT源（修复权限问题）
     ###########################################################################
     - name: Clean Disk Space & Fix APT Source
       run: |
@@ -30,20 +30,22 @@ jobs:
         sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/Python
         sudo apt clean && sudo apt autoremove -y --purge
         sudo rm -rf /var/log/* /tmp/* /var/tmp/*
-        # 修复APT源：添加universe组件（解决libuuid-dev等包找不到）
-        sudo sed -i '/^deb/s/$/ universe/' /etc/apt/sources.list
-        # 替换阿里云源（含universe）
-        sudo echo "deb http://mirrors.aliyun.com/ubuntu/ jammy main universe restricted multiverse" > /etc/apt/sources.list
-        sudo echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main universe restricted multiverse" >> /etc/apt/sources.list
-        sudo echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-security main universe restricted multiverse" >> /etc/apt/sources.list
-        # 更新APT缓存
-        sudo apt update -y
+        
+        # 修复APT源：使用sudo+tee写入（解决Permission denied）
+        sudo tee /etc/apt/sources.list > /dev/null << EOF
+        deb http://mirrors.aliyun.com/ubuntu/ jammy main universe restricted multiverse
+        deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main universe restricted multiverse
+        deb http://mirrors.aliyun.com/ubuntu/ jammy-security main universe restricted multiverse
+        EOF
+        
+        # 更新APT缓存（强制刷新）
+        sudo apt update -y --fix-missing
         echo -e "\n=== 磁盘空间状态 ==="
         df -h
         echo -e "====================\n"
 
     ###########################################################################
-    # 2. 安装编译依赖（替换找不到的包）
+    # 2. 安装编译依赖（替换找不到的包 + 权限修复）
     ###########################################################################
     - name: Install Build Dependencies
       env:
@@ -403,18 +405,24 @@ jobs:
     - name: Build Firmware (8 Core)
       run: |
         cd /opt/immortalwrt
+        # 16G交换分区（8核编译内存需求高）
         sudo fallocate -l 16G /swapfile
         sudo chmod 600 /swapfile
         sudo mkswap /swapfile
         sudo swapon /swapfile
+        # 单线程校验配置
         make -j1 V=s 2>&1 | tee config_check.log
+        # 8核并行编译
         make -j${CORE_COUNT} V=s 2>&1 | tee build.log
+        # 整理产物
         mkdir -p /opt/images
         cp -f bin/targets/mediatek/mt798x/*.bin /opt/images/
         cp -f bin/targets/mediatek/mt798x/*.sha256sum /opt/images/
         cp -f config_check.log build.log /opt/images/
+        # 压缩产物
         cd /opt/images
         zip -r ImmortalWrt-mt7986-AX6000-$(date +%Y%m%d).zip ./*
+        # 查看产物
         echo -e "\n=== 编译产物 ==="
         ls -lh /opt/images/
         df -h

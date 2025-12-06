@@ -21,37 +21,32 @@ jobs:
 
     steps:
     ###########################################################################
-    # 1. 深度清理磁盘 + 修复APT源（修复权限问题）
+    # 1. 深度清理磁盘 + 修复 APT 源
     ###########################################################################
     - name: Clean Disk Space & Fix APT Source
       run: |
-        # 清理大文件
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell
         sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/Python
         sudo apt clean && sudo apt autoremove -y --purge
         sudo rm -rf /var/log/* /tmp/* /var/tmp/*
         
-        # 修复APT源：使用sudo+tee写入（解决Permission denied）
         sudo tee /etc/apt/sources.list > /dev/null << EOF
         deb http://mirrors.aliyun.com/ubuntu/ jammy main universe restricted multiverse
         deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main universe restricted multiverse
         deb http://mirrors.aliyun.com/ubuntu/ jammy-security main universe restricted multiverse
         EOF
         
-        # 更新APT缓存（强制刷新）
         sudo apt update -y --fix-missing
         echo -e "\n=== 磁盘空间状态 ==="
         df -h
-        echo -e "====================\n"
 
     ###########################################################################
-    # 2. 安装编译依赖（替换找不到的包 + 权限修复）
+    # 2. 安装编译依赖
     ###########################################################################
     - name: Install Build Dependencies
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        # 核心依赖：替换libudev-zero-dev→libudev-dev，libuuid-dev→uuid-dev
         sudo apt install -y --no-install-recommends \
         build-essential clang-14 llvm-14 flex bison g++ gawk gcc-multilib g++-multilib \
         gettext git libncurses5-dev libssl-dev python3-distutils python3-pip python3-docutils \
@@ -61,23 +56,29 @@ jobs:
         squashfs-tools libconfuse-dev libblkid-dev libcap-ng-dev libcbor-dev libevdev-dev \
         libfido2-dev libnl-3-dev libnl-genl-3-dev libnl-nf-3-dev libnl-route-3-dev libpcap-dev \
         libstdc++-11-dev uuid-dev libatomic1 libncurses6
-        # 配置Python3默认
+        
         sudo ln -sf /usr/bin/python3 /usr/bin/python
         pip3 install --no-cache-dir ninja
         sudo ln -sf /usr/bin/autoconf /usr/bin/confutils
-        # 清理缓存
+        
         sudo apt clean && sudo rm -rf ~/.cache/pip
         echo -e "\n=== 依赖安装完成，编译核心数：${CORE_COUNT} ==="
 
     ###########################################################################
-    # 3. 拉取源码+加载自定义.config
+    # 3. 拉取源码 + 加载自定义.config（核心修复：移除 feeds 的 --no-cache 参数）
     ###########################################################################
     - name: Clone Source & Apply Custom Config
       run: |
+        # 浅克隆源码
         git clone --depth=1 --branch ${REPO_BRANCH} ${REPO_URL} /opt/immortalwrt
         cd /opt/immortalwrt
-        ./scripts/feeds update -a --no-cache
+        
+        # 修复：feeds update 仅保留合法参数 -a（更新所有feeds），移除 --no-cache
+        ./scripts/feeds update -a
+        # feeds install 保留 -a（安装所有feeds的包）
         ./scripts/feeds install -a
+        
+        # 替换自定义.config
         rm -f .config
         cat > .config << 'EOF'
         CONFIG_TARGET_mediatek=y
@@ -395,7 +396,11 @@ jobs:
         # CONFIG_MTK_RLM_CAL_CACHE_SUPPORT is not set
         # CONFIG_MTK_SNIFFER_RADIOTAP_SUPPORT is not set
         EOF
+        
+        # 自动补全配置依赖
         make defconfig
+        
+        # 清理.git目录节省空间
         rm -rf .git feeds/.git
         echo -e "\n=== 自定义.config已加载 ==="
 
@@ -405,23 +410,29 @@ jobs:
     - name: Build Firmware (8 Core)
       run: |
         cd /opt/immortalwrt
-        # 16G交换分区（8核编译内存需求高）
+        
+        # 创建16G交换分区
         sudo fallocate -l 16G /swapfile
         sudo chmod 600 /swapfile
         sudo mkswap /swapfile
         sudo swapon /swapfile
+        
         # 单线程校验配置
         make -j1 V=s 2>&1 | tee config_check.log
+        
         # 8核并行编译
         make -j${CORE_COUNT} V=s 2>&1 | tee build.log
+        
         # 整理产物
         mkdir -p /opt/images
         cp -f bin/targets/mediatek/mt798x/*.bin /opt/images/
         cp -f bin/targets/mediatek/mt798x/*.sha256sum /opt/images/
         cp -f config_check.log build.log /opt/images/
+        
         # 压缩产物
         cd /opt/images
         zip -r ImmortalWrt-mt7986-AX6000-$(date +%Y%m%d).zip ./*
+        
         # 查看产物
         echo -e "\n=== 编译产物 ==="
         ls -lh /opt/images/
